@@ -1,0 +1,14 @@
+# Virtual Environment
+venv/
+env/
+__pycache__/
+
+# Security & API Keys
+.env
+credentials.json
+client_secret.json
+token.json
+
+# OS generated files
+.DS_Store
+Thumbs.db
