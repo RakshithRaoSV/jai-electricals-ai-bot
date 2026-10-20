@@ -1,9 +1,9 @@
 import os
 import io
 import re
+import base64
 from datetime import datetime
 from email.message import EmailMessage
-import base64
 from dotenv import load_dotenv
 
 from google.auth.transport.requests import Request, AuthorizedSession
@@ -12,8 +12,15 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
+try:
+    from num2words import num2words
+except ImportError:
+    print("Please run: pip install num2words")
+    num2words = None
+
 load_dotenv()
 
+# --- CONFIGURATION ---
 SCOPES = [
     'https://mail.google.com/',
     'https://www.googleapis.com/auth/spreadsheets',
@@ -23,449 +30,348 @@ SCOPES = [
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 ARCHIVE_FOLDER_ID = os.getenv('ARCHIVE_FOLDER_ID')
 
-
-def get_oauth_credentials():
-    """Loads or refreshes token.json with Gmail, Sheets, and Drive permissions."""
+def get_oauth_credentials(force_refresh=False):
+    if force_refresh and os.path.exists('token.json'): os.remove('token.json')
     creds = None
     if os.path.exists('token.json'):
-        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-
+        try: creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+        except Exception: os.remove('token.json')
     if not creds or not creds.valid or not creds.has_scopes(SCOPES):
         if creds and creds.expired and creds.refresh_token and creds.has_scopes(SCOPES):
-            creds.refresh(Request())
-        else:
-            print("\nOpening browser to authorize Google Drive & Sheets access for your bot account...")
+            try: creds.refresh(Request())
+            except Exception:
+                os.remove('token.json')
+                creds = None
+        if not creds:
+            print("\n[Auth] Missing or outdated security token. Opening browser for fresh login...")
             flow = InstalledAppFlow.from_client_secrets_file('client_secret.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token_file:
-            token_file.write(creds.to_json())
-
+            creds = flow.run_local_server(port=0, prompt='consent')
+        with open('token.json', 'w') as token_file: token_file.write(creds.to_json())
     return creds
 
-
-def get_services():
-    creds = get_oauth_credentials()
-    sheets_service = build('sheets', 'v4', credentials=creds)
-    drive_service = build('drive', 'v3', credentials=creds)
-    gmail_service = build('gmail', 'v1', credentials=creds)
-    authed_session = AuthorizedSession(creds)
-    return sheets_service, drive_service, gmail_service, authed_session
-
+def get_services(force_refresh=False):
+    creds = get_oauth_credentials(force_refresh)
+    return build('sheets', 'v4', credentials=creds), build('drive', 'v3', credentials=creds), build('gmail', 'v1', credentials=creds), AuthorizedSession(creds)
 
 def load_master_stock_map(sheets_service):
-    """Loads Master_Stock into a dictionary keyed by uppercase ITEM_NAME."""
-    res = sheets_service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID, range='Master_Stock!A:F'
-    ).execute()
+    res = sheets_service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range='Master_Stock!A:F').execute()
     rows = res.get('values', [])
-    if not rows:
-        return {}, []
-
+    if not rows: return {}, []
     headers = [h.strip().upper() for h in rows[0]]
     stock_map = {}
-    for idx, row in enumerate(rows[1:], start=2):
+    for row in rows[1:]:
         row += [''] * (len(headers) - len(row))
         item_dict = dict(zip(headers, row))
-        item_dict['_row_index'] = idx
         name = item_dict.get('ITEM_NAME', '').strip()
-        if name:
-            stock_map[name.upper()] = item_dict
+        if name: stock_map[name.upper()] = item_dict
     return stock_map, rows[0]
 
-
 def sync_item_to_master_stock(sheets_service, stock_map, item_name, hsn, uom, brand, base_price, raw_alias=""):
-    """Silently adds new items to Master_Stock if they don't exist yet."""
-    clean_name = item_name.strip()
-    if not clean_name or clean_name == "—":
-        return
-
-    key = clean_name.upper()
-    if key not in stock_map:
-        new_row = [
-            clean_name,
-            str(hsn or ''),
-            str(uom or 'NO').upper(),
-            str(brand or ''),
-            str(base_price or ''),
-            str(raw_alias or '')
-        ]
-        sheets_service.spreadsheets().values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Master_Stock!A:F',
-            valueInputOption='USER_ENTERED',
-            insertDataOption='INSERT_ROWS',
-            body={'values': [new_row]}
-        ).execute()
-        stock_map[key] = {
-            'ITEM_NAME': clean_name,
-            'HSN_CODE': str(hsn or ''),
-            'UOM': str(uom or 'NO').upper(),
-            'BRAND': str(brand or ''),
-            'BASE_PRICE': str(base_price or ''),
-            'ALIAS': str(raw_alias or '')
-        }
-        print(f" -> [Auto-Learn] Added new item to Master_Stock: '{clean_name}'")
-
+    clean_name = str(item_name).strip().upper()
+    if not clean_name or clean_name == "—" or clean_name in stock_map: return
+    new_row = [clean_name, str(hsn or '').upper(), str(uom or 'NO').upper(), str(brand or '').upper(), str(base_price or ''), str(raw_alias or '').upper()]
+    sheets_service.spreadsheets().values().append(spreadsheetId=SPREADSHEET_ID, range='Master_Stock!A:F', valueInputOption='USER_ENTERED', insertDataOption='INSERT_ROWS', body={'values': [new_row]}).execute()
+    stock_map[clean_name] = {'BRAND': str(brand or '').upper(), 'HSN_CODE': str(hsn or '').upper(), 'BASE_PRICE': str(base_price or '')}
 
 def get_or_create_company_folder(drive_service, company_name):
-    """Finds or creates Archived Quotes -> Company Name folder."""
     safe_name = company_name.replace("'", "\\'")
-    query = (
-        f"'{ARCHIVE_FOLDER_ID}' in parents and "
-        f"name = '{safe_name}' and "
-        f"mimeType = 'application/vnd.google-apps.folder' and "
-        f"trashed = false"
-    )
+    query = f"'{ARCHIVE_FOLDER_ID}' in parents and name = '{safe_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     res = drive_service.files().list(q=query, fields="files(id, name)").execute()
-    files = res.get('files', [])
-    if files:
-        return files[0]['id']
-
-    folder_meta = {
-        'name': company_name,
-        'mimeType': 'application/vnd.google-apps.folder',
-        'parents': [ARCHIVE_FOLDER_ID]
-    }
-    folder = drive_service.files().create(body=folder_meta, fields='id').execute()
-    print(f" -> Created company folder: '{company_name}'")
+    if res.get('files'): return res['files'][0]['id']
+    folder = drive_service.files().create(body={'name': company_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [ARCHIVE_FOLDER_ID]}, fields='id').execute()
     return folder['id']
 
+def export_sheet_to_pdf_InDrive(sheets_service, drive_service, authed_session, spreadsheet_id, gid, pdf_filename, folder_id):
+    try:
+        sheets_service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={'requests': [{'updateDimensionProperties': {'range': {'sheetId': gid, 'dimension': 'COLUMNS', 'startIndex': 10, 'endIndex': 26}, 'properties': {'hiddenByUser': True}, 'fields': 'hiddenByUser'}}]}).execute()
+        export_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export?format=pdf&gid={gid}&size=A4&portrait=true&fitw=true&gridlines=false&printtitle=false"
+        resp = authed_session.get(export_url)
+        if resp.status_code != 200: raise RuntimeError(f"Failed to export PDF: {resp.status_code} {resp.text}")
+        pdf_bytes = resp.content
+        safe_pdf_name = pdf_filename.replace("'", "\\'")
+        q = f"'{folder_id}' in parents and name = '{safe_pdf_name}' and trashed = false"
+        existing = drive_service.files().list(q=q, fields="files(id)").execute().get('files', [])
+        media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype='application/pdf', resumable=False)
+        if existing: drive_service.files().update(fileId=existing[0]['id'], media_body=media).execute()
+        else: drive_service.files().create(body={'name': pdf_filename, 'parents': [folder_id]}, media_body=media, fields='id').execute()
+        print(f" -> Saved PDF to Drive: '{pdf_filename}'")
+        return pdf_bytes
+    finally:
+        sheets_service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={'requests': [{'updateDimensionProperties': {'range': {'sheetId': gid, 'dimension': 'COLUMNS', 'startIndex': 10, 'endIndex': 26}, 'properties': {'hiddenByUser': False}, 'fields': 'hiddenByUser'}}]}).execute()
 
-def get_next_quote_number(drive_service):
-    """Scans Drive for completed QTN-XX PDFs to determine the next quote number."""
-    query = (
-        "name contains 'QTN-' and "
-        "mimeType = 'application/pdf' and "
-        "not name contains 'Revised' and "
-        "trashed = false"
-    )
-    res = drive_service.files().list(q=query, fields="files(name)").execute()
-    max_num = 0
-    for f in res.get('files', []):
-        match = re.search(r'QTN-(\d+)', f['name'])
-        if match:
-            max_num = max(max_num, int(match.group(1)))
-    return f"QTN-{max_num + 1:02d}"
-
-
-def export_sheet_to_pdf_InDrive(drive_service, authed_session, spreadsheet_id, gid, pdf_filename, folder_id):
-    """Exports columns A:J of the Quotation sheet as a PDF and saves to the company folder."""
-    export_url = (
-        f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export"
-        f"?format=pdf&gid={gid}"
-        f"&size=A4&portrait=true&fitw=true"
-        f"&gridlines=false&printtitle=false"
-        f"&c1=0&c2=10"
-    )
-    resp = authed_session.get(export_url)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Failed to export PDF: {resp.status_code} {resp.text}")
-
-    pdf_bytes = resp.content
-
-    safe_pdf_name = pdf_filename.replace("'", "\\'")
-    q = f"'{folder_id}' in parents and name = '{safe_pdf_name}' and trashed = false"
-    existing = drive_service.files().list(q=q, fields="files(id)").execute().get('files', [])
-
-    media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype='application/pdf', resumable=False)
-    if existing:
-        drive_service.files().update(fileId=existing[0]['id'], media_body=media).execute()
-    else:
-        file_meta = {
-            'name': pdf_filename,
-            'parents': [folder_id]
-        }
-        drive_service.files().create(body=file_meta, media_body=media, fields='id').execute()
-
-    print(f" -> Saved PDF to Drive: '{pdf_filename}'")
-    return pdf_bytes
-
-
-def send_quote_email(gmail_service, recipient_email, quote_no, company_name, pdf_bytes, pdf_filename):
-    """Emails the initial quotation PDF to the client."""
-    if not recipient_email or '@' not in recipient_email:
-        print(" -> No valid recipient email found; skipping email send.")
-        return
-
+def send_quote_email(gmail_service, recipient_email, quote_no, company_name, pdf_bytes, pdf_filename, po_ref):
+    if not recipient_email or '@' not in recipient_email: return
     msg = EmailMessage()
-    msg['Subject'] = f"Quotation {quote_no} - Jai Electricals ({company_name})"
+    subject_tail = f"({company_name})" if po_ref.upper() == 'GENERAL' else f"({company_name} - {po_ref})"
+    msg['Subject'] = f"Quotation {quote_no} - Jai Electricals {subject_tail}"
     msg['From'] = "Jai Electricals <jaielectri.quotes@gmail.com>"
     msg['To'] = recipient_email
-    msg.set_content(
-        f"Dear {company_name},\n\n"
-        f"Thank you for your inquiry. Please find attached our quotation ({quote_no}) for your requested electrical materials.\n\n"
-        f"For any modifications or inquiries, please feel free to contact us.\n\n"
-        f"Best Regards,\n"
-        f"JAI ELECTRICALS\n"
-        f"Hosur - 635 109\n"
-        f"Phone: 9585577966"
-    )
-
-    msg.add_attachment(
-        pdf_bytes,
-        maintype='application',
-        subtype='pdf',
-        filename=pdf_filename
-    )
-
-    raw_msg = base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')
-    gmail_service.users().messages().send(userId='me', body={'raw': raw_msg}).execute()
+    msg.set_content(f"Dear {company_name},\n\nThank you for your inquiry. Please find attached our quotation ({quote_no}) for your requested materials.\n\nBest Regards,\nJAI ELECTRICALS")
+    msg.add_attachment(pdf_bytes, maintype='application', subtype='pdf', filename=pdf_filename)
+    gmail_service.users().messages().send(userId='me', body={'raw': base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')}).execute()
     print(f" -> Emailed '{pdf_filename}' to {recipient_email}")
 
-
-def create_quote_spreadsheet_and_pdf(
-    sheets_service, drive_service, gmail_service, authed_session,
-    quote_no, company_name, client_email, items
-):
-    """Clones template into company folder, populates Row 12+, exports PDF, and emails client."""
-    folder_id = get_or_create_company_folder(drive_service, company_name)
-    sheet_title = f"{quote_no} {company_name}"
-
-    # Remove any incomplete sheet with the same name from a prior failed run
-    safe_title = sheet_title.replace("'", "\\'")
-    old_q = (
-        f"'{folder_id}' in parents and name = '{safe_title}' and "
-        f"mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false"
-    )
-    for old_f in drive_service.files().list(q=old_q, fields="files(id)").execute().get('files', []):
-        drive_service.files().delete(fileId=old_f['id']).execute()
-
-    # 1. Copy master spreadsheet into the company folder
-    copied_file = drive_service.files().copy(
-        fileId=SPREADSHEET_ID,
-        body={'name': sheet_title, 'parents': [folder_id]}
-    ).execute()
-    new_sheet_id = copied_file['id']
-    print(f" -> Created standalone Google Sheet: '{sheet_title}'")
-
-    # 2. Keep 'Quotation' tab, delete 'Master_Stock' & 'Bulk Import', and ensure at least 13 columns (A-M)
-    meta = sheets_service.spreadsheets().get(spreadsheetId=new_sheet_id).execute()
-    quotation_gid = 0
-    current_cols = 10
-    structural_requests = []
-
-    for s in meta.get('sheets', []):
-        title = s['properties']['title']
-        sid = s['properties']['sheetId']
-        if title.strip().lower() == 'quotation':
-            quotation_gid = sid
-            current_cols = s['properties'].get('gridProperties', {}).get('columnCount', 10)
-        else:
-            structural_requests.append({'deleteSheet': {'sheetId': sid}})
-
-    if current_cols < 13:
-        structural_requests.append({
-            'appendDimension': {
-                'sheetId': quotation_gid,
-                'dimension': 'COLUMNS',
-                'length': 13 - current_cols
-            }
-        })
-
-    if structural_requests:
-        sheets_service.spreadsheets().batchUpdate(
-            spreadsheetId=new_sheet_id,
-            body={'requests': structural_requests}
-        ).execute()
-
-    # 3. Clear old sample item rows (Row 12 to 110) in Quotation tab
-    sheets_service.spreadsheets().values().clear(
-        spreadsheetId=new_sheet_id,
-        range='Quotation!A12:J110'
-    ).execute()
-
-    # 4. Prepare header cells (B4, J4, A6) and item rows starting at Row 12
-    today_str = datetime.now().strftime('%d/%m/%Y')
-    item_rows = []
-    for idx, item in enumerate(items, start=1):
-        row_num = 11 + idx  # Starts at Row 12
-        net_rate_formula = f'=IF(ISBLANK(B{row_num}), "", G{row_num}*(1-IF(ISNUMBER(H{row_num}), H{row_num}, 0)))'
-        amount_formula = f'=IF(ISBLANK(D{row_num}), "", D{row_num}*I{row_num})'
-
-        item_rows.append([
-            idx,                        # A: S.no
-            item['official_name'],      # B: Item Description
-            item['hsn'],                # C: HSN
-            item['qty'],                # D: Qty
-            item['uom'],                # E: UOM
-            item['brand'],              # F: Brand
-            item['base_price'],         # G: Base Price
-            "",                         # H: Disc %
-            net_rate_formula,           # I: Net Rate
-            amount_formula              # J: Amount
-        ])
-
-    # Add Staff Revision Control Box in Columns L & M (outside print area A:J)
-    batch_data = [
-        {'range': 'Quotation!B4', 'values': [[quote_no]]},
-        {'range': 'Quotation!J4', 'values': [[today_str]]},
-        {'range': 'Quotation!A6', 'values': [[f"To:\n{company_name}"]]},
-        {'range': f'Quotation!A12:J{11 + len(item_rows)}', 'values': item_rows},
-        {'range': 'Quotation!L3:L5', 'values': [
-            ["STAFF REVISION CONTROL"],
-            ["Type REVISE in M4 ->"],
-            ["Status: Initial Quote Sent"]
-        ]},
-        {'range': 'Quotation!M4', 'values': [[""]]}
-    ]
-
-    sheets_service.spreadsheets().values().batchUpdate(
-        spreadsheetId=new_sheet_id,
-        body={'valueInputOption': 'USER_ENTERED', 'data': batch_data}
-    ).execute()
-
-    # 5. Export initial PDF and email to client
-    pdf_filename = f"{sheet_title}.pdf"
-    pdf_bytes = export_sheet_to_pdf_InDrive(
-        drive_service, authed_session, new_sheet_id, quotation_gid, pdf_filename, folder_id
-    )
-    send_quote_email(gmail_service, client_email, quote_no, company_name, pdf_bytes, pdf_filename)
-
+def get_amount_in_words(amount):
+    if not num2words: return f"Rupees {amount} Only"
+    return f"Rupees {num2words(amount, lang='en_IN').title()} Only"
 
 def process_approved_quotes(sheets_service, drive_service, gmail_service, authed_session):
-    """Scans Bulk Import for Action == APPROVE, syncs new items to Master_Stock, and creates quotes."""
     stock_map, _ = load_master_stock_map(sheets_service)
+    
+    result = sheets_service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range='Bulk Import!A:R').execute()
+    rows = result.get('values', [])
+    if len(rows) <= 1: return
 
-    res = sheets_service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID, range='Bulk Import!A:I'
-    ).execute()
-    rows = res.get('values', [])
-    if len(rows) <= 1:
-        print("No rows found in Bulk Import.")
-        return
+    approved_batches = {}
+    current_block_key = None
 
-    batches = {}
-    for row_idx, row in enumerate(rows[1:], start=2):
-        row += [''] * (9 - len(row))
-        status, raw_req, official_name, qty, uom, unit_price, total, company, action = row[:9]
+    for i, row in enumerate(rows[1:], start=2): 
+        row += [''] * (18 - len(row))
+        col_a, address, po_ref, source_link, status, client_req, official_name, brand, hsn, qty, uom, unit_price, discount, total, freight, gst_mode, tax_region, action = row[:18]
+        
+        if col_a.strip():
+            parts = col_a.split('\n')
+            company = parts[0].strip()
+            email = parts[1].strip() if len(parts) > 1 else ""
+            clean_po = po_ref.strip() if po_ref.strip() else 'General'
+            
+            if action.strip().upper() == 'APPROVE' and company:
+                current_block_key = f"{company}_{clean_po}_{i}"
+                approved_batches[current_block_key] = {
+                    'company': company, 'email': email, 'address': address, 'po_ref': clean_po, 
+                    'freight': freight, 'gst': gst_mode, 'tax_reg': tax_region, 'action_row': i,
+                    'items': [], 'row_indices': []
+                }
+            else:
+                current_block_key = None 
+                
+        if current_block_key and client_req.strip():
+            cat = stock_map.get(official_name.upper(), {})
+            final_unit_price = unit_price.strip() if unit_price.strip() else cat.get('BASE_PRICE', '0')
+            final_brand = brand.strip() if brand.strip() else cat.get('BRAND', '')
+            final_hsn = hsn.strip() if hsn.strip() else cat.get('HSN_CODE', '')
+            
+            approved_batches[current_block_key]['items'].append({
+                'official_name': official_name, 'qty': qty, 'uom': uom, 'discount': discount, 
+                'brand': final_brand, 'hsn': final_hsn, 'base_price': final_unit_price
+            })
+            approved_batches[current_block_key]['row_indices'].append(i)
 
-        if action.strip().upper() != 'APPROVE':
-            continue
+    for key, data in approved_batches.items():
+        quote_no = f"QTN-{int(datetime.now().timestamp()) % 10000:04d}" 
+        print(f"\nProcessing {quote_no} for '{data['company']}' (PO: {data['po_ref']})...")
+        create_quote_spreadsheet_and_pdf(sheets_service, drive_service, gmail_service, authed_session, quote_no, data)
+        
+        status_data = [{'range': f'Bulk Import!E{row_idx}', 'values': [[f'✅ SENT ({quote_no})']]} for row_idx in data['row_indices']]
+        status_data.append({'range': f'Bulk Import!R{data["action_row"]}', 'values': [[f'✅ SENT ({quote_no})']]})
+        sheets_service.spreadsheets().values().batchUpdate(spreadsheetId=SPREADSHEET_ID, body={'valueInputOption': 'USER_ENTERED', 'data': status_data}).execute()
 
-        company_clean = company.strip() or "Walk-in Client"
-        email_match = re.search(r'\[(.*?)\]', raw_req)
-        client_email = email_match.group(1).strip() if email_match else ""
-        clean_raw_alias = re.sub(r'^\[.*?\]\s*', '', raw_req).strip()
+# --- BULLETPROOF DATA SCRUBBER ---
+def clean_num(v):
+    if not v: return 0.0
+    s = str(v).replace(',', '')
+    m = re.search(r'-?\d+(?:\.\d+)?', s)
+    return float(m.group()) if m else 0.0
 
-        stock_entry = stock_map.get(official_name.strip().upper(), {})
-        final_hsn = stock_entry.get('HSN_CODE', '')
-        final_uom = (uom.strip() or stock_entry.get('UOM', 'NO')).upper()
-        final_brand = stock_entry.get('BRAND', '')
-        final_price = unit_price.strip() or stock_entry.get('BASE_PRICE', '0')
+def create_quote_spreadsheet_and_pdf(sheets_service, drive_service, gmail_service, authed_session, quote_no, data):
+    company, address, items, po_ref = data['company'], data['address'], data['items'], data['po_ref']
+    folder_id = get_or_create_company_folder(drive_service, company)
+    file_tail = "" if po_ref.upper() == 'GENERAL' else f" - {re.sub(r'[\\/*?:\"<>|]', '', po_ref)}"
+    sheet_title = f"{quote_no} {company}{file_tail}"
 
-        sync_item_to_master_stock(
-            sheets_service, stock_map,
-            official_name, final_hsn, final_uom, final_brand, final_price, clean_raw_alias
-        )
+    for old_f in drive_service.files().list(q=f"'{folder_id}' in parents and name = '{sheet_title.replace('''\'''', '''\\\'''')}' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false", fields="files(id)").execute().get('files', []):
+        drive_service.files().delete(fileId=old_f['id']).execute()
 
-        if company_clean not in batches:
-            batches[company_clean] = {
-                'client_email': client_email,
-                'items': [],
-                'row_indices': []
-            }
+    new_sheet_id = drive_service.files().copy(fileId=SPREADSHEET_ID, body={'name': sheet_title, 'parents': [folder_id]}).execute()['id']
+    meta = sheets_service.spreadsheets().get(spreadsheetId=new_sheet_id).execute()
+    
+    quotation_gid = 0
+    current_cols = 10
+    for s in meta['sheets']:
+        if s['properties']['title'].lower() == 'quotation':
+            quotation_gid = s['properties']['sheetId']
+            current_cols = s['properties'].get('gridProperties', {}).get('columnCount', 10)
+            
+    if current_cols < 13:
+        sheets_service.spreadsheets().batchUpdate(spreadsheetId=new_sheet_id, body={'requests': [{'appendDimension': {'sheetId': quotation_gid, 'dimension': 'COLUMNS', 'length': 13 - current_cols}}]}).execute()
 
-        batches[company_clean]['items'].append({
-            'official_name': official_name.strip(),
-            'hsn': final_hsn,
-            'qty': qty,
-            'uom': final_uom,
-            'brand': final_brand,
-            'base_price': final_price
-        })
-        batches[company_clean]['row_indices'].append(row_idx)
+    sheet_data = sheets_service.spreadsheets().values().get(spreadsheetId=new_sheet_id, range='Quotation!I1:I150').execute().get('values', [])
+    subtotal_idx = 111 
+    for i, row in enumerate(sheet_data):
+        if row and len(row) > 0 and 'SUBTOTAL' in str(row[0]).upper():
+            subtotal_idx = i
+            break
 
-    if not batches:
-        print("No rows marked 'APPROVE' in Bulk Import.")
-        return
+    sheets_service.spreadsheets().values().clear(spreadsheetId=new_sheet_id, range=f'Quotation!A12:J{subtotal_idx}').execute()
 
-    for company_name, batch in batches.items():
-        quote_no = get_next_quote_number(drive_service)
-        print(f"\nProcessing Approved Quote {quote_no} for '{company_name}' ({len(batch['items'])} items)...")
-        create_quote_spreadsheet_and_pdf(
-            sheets_service, drive_service, gmail_service, authed_session,
-            quote_no, company_name, batch['client_email'], batch['items']
-        )
+    item_rows = []
+    python_subtotal = 0.0
+    for idx, item in enumerate(items, start=1):
+        row_num = 11 + idx  
+        
+        # Aggressive Scrubbing
+        bp_val = clean_num(item.get('base_price'))
+        qty_val = clean_num(item.get('qty'))
+        
+        d_raw = clean_num(item.get('discount'))
+        d_val = (d_raw / 100.0) if d_raw > 1.0 else d_raw
+        sheet_disc = d_val if d_val > 0 else ""
 
-        update_data = [
-            {'range': f'Bulk Import!I{r}', 'values': [[f'✅ SENT ({quote_no})']]}
-            for r in batch['row_indices']
-        ]
-        sheets_service.spreadsheets().values().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body={'valueInputOption': 'USER_ENTERED', 'data': update_data}
-        ).execute()
+        # Fail-safe Formulas
+        net_rate_fmla = f'=IF(B{row_num}="", "", G{row_num}*(1-IF(ISNUMBER(H{row_num}), H{row_num}, 0)))'
+        amt_fmla = f'=IF(B{row_num}="", "", D{row_num}*I{row_num})'
 
+        item_rows.append([
+            idx, 
+            str(item.get('official_name', '')).upper(), 
+            str(item.get('hsn', '')).upper(), 
+            qty_val, 
+            str(item.get('uom', '')).upper(), 
+            str(item.get('brand', '')).upper(), 
+            bp_val, 
+            sheet_disc, 
+            net_rate_fmla, 
+            amt_fmla
+        ])
+        python_subtotal += (qty_val * bp_val) * (1.0 - d_val)
+
+    last_row = 11 + len(items)
+    frt_val = clean_num(data.get('freight'))
+    taxable = python_subtotal + frt_val
+    gst_mode = str(data.get('gst', '')).upper()
+    tax_reg = str(data.get('tax_reg', '')).upper()
+
+    structural_reqs = []
+    gt_idx = subtotal_idx + 3 
+    
+    if 'WITHOUT' in gst_mode or 'IGST' in tax_reg:
+        structural_reqs.append({'deleteDimension': {'range': {'sheetId': quotation_gid, 'dimension': 'ROWS', 'startIndex': subtotal_idx + 2, 'endIndex': subtotal_idx + 3}}})
+        gt_idx -= 1
+    if 'WITHOUT' in gst_mode:
+        structural_reqs.append({'deleteDimension': {'range': {'sheetId': quotation_gid, 'dimension': 'ROWS', 'startIndex': subtotal_idx + 1, 'endIndex': subtotal_idx + 2}}})
+        gt_idx -= 1
+    if frt_val > 0:
+        structural_reqs.append({'insertDimension': {'range': {'sheetId': quotation_gid, 'dimension': 'ROWS', 'startIndex': subtotal_idx + 1, 'endIndex': subtotal_idx + 2}, 'inheritFromBefore': True}})
+        gt_idx += 1
+        
+    structural_reqs.append({'insertDimension': {'range': {'sheetId': quotation_gid, 'dimension': 'ROWS', 'startIndex': gt_idx + 1, 'endIndex': gt_idx + 2}, 'inheritFromBefore': False}})
+    if structural_reqs: sheets_service.spreadsheets().batchUpdate(spreadsheetId=new_sheet_id, body={'requests': structural_reqs}).execute()
+
+    new_subtotal_row = subtotal_idx + 1
+    current_row = new_subtotal_row
+    
+    if frt_val > 0:
+        current_row += 1
+        freight_row = current_row
+    else: freight_row = None
+        
+    if 'WITHOUT' in gst_mode:
+        tax1_row, tax2_row = None, None
+        current_row += 1
+        gt_row = current_row
+        est_gt = taxable
+    elif 'IGST' in tax_reg:
+        current_row += 1
+        tax1_row = current_row
+        tax2_row = None
+        current_row += 1
+        gt_row = current_row
+        est_gt = taxable * 1.18
+    else:
+        current_row += 1
+        tax1_row = current_row
+        current_row += 1
+        tax2_row = current_row
+        current_row += 1
+        gt_row = current_row
+        est_gt = taxable * 1.18
+        
+    words_row = gt_row + 1
+
+    to_text = f"To:\n{str(company).upper()}\n{address}"
+    if po_ref.upper() != 'GENERAL':
+        to_text += f"\nPO Ref: {po_ref}"
+
+    update_data = [
+        {'range': 'Quotation!B4', 'values': [[quote_no]]},
+        {'range': 'Quotation!J4', 'values': [[datetime.now().strftime('%d/%m/%Y')]]},
+        {'range': 'Quotation!A6', 'values': [[to_text]]},
+        {'range': f'Quotation!A12:J{last_row}', 'values': item_rows},
+        {'range': f'Quotation!A{words_row}', 'values': [[f"Amount in Words: {get_amount_in_words(round(est_gt))}"]]},
+        {'range': f'Quotation!J{new_subtotal_row}', 'values': [[f"=SUM(J12:J{last_row})"]]},
+        {'range': 'Quotation!L3:L5', 'values': [["STAFF REVISION CONTROL"], ["Type REVISE in M4 ->"], ["Status: Initial Quote Sent"]]},
+        {'range': 'Quotation!M4', 'values': [[""]]}
+    ]
+    
+    tax_base = f"J{new_subtotal_row}"
+    if freight_row:
+        update_data.append({'range': f'Quotation!I{freight_row}:J{freight_row}', 'values': [["Freight", frt_val]]})
+        tax_base = f"(J{new_subtotal_row}+J{freight_row})"
+        
+    if tax1_row and 'IGST' in tax_reg:
+        update_data.append({'range': f'Quotation!I{tax1_row}:J{tax1_row}', 'values': [["IGST (18%)", f"=IFERROR({tax_base}*0.18, 0)"]]})
+    elif tax1_row:
+        update_data.append({'range': f'Quotation!I{tax1_row}:J{tax1_row}', 'values': [["CGST (9%)", f"=IFERROR({tax_base}*0.09, 0)"]]})
+        update_data.append({'range': f'Quotation!I{tax2_row}:J{tax2_row}', 'values': [["SGST (9%)", f"=IFERROR({tax_base}*0.09, 0)"]]})
+        
+    update_data.append({'range': f'Quotation!J{gt_row}', 'values': [[f"=SUM(J{new_subtotal_row}:J{gt_row-1})"]]})
+
+    sheets_service.spreadsheets().values().batchUpdate(spreadsheetId=new_sheet_id, body={'valueInputOption': 'USER_ENTERED', 'data': update_data}).execute()
+
+    post_reqs = [
+        {'mergeCells': {'range': {'sheetId': quotation_gid, 'startRowIndex': words_row - 1, 'endRowIndex': words_row, 'startColumnIndex': 0, 'endColumnIndex': 10}, 'mergeType': 'MERGE_ALL'}},
+        {'updateDimensionProperties': {'range': {'sheetId': quotation_gid, 'dimension': 'ROWS', 'startIndex': last_row, 'endIndex': new_subtotal_row - 1}, 'properties': {'hiddenByUser': True}, 'fields': 'hiddenByUser'}},
+        {'repeatCell': {'range': {'sheetId': quotation_gid, 'startRowIndex': new_subtotal_row - 1, 'endRowIndex': gt_row, 'startColumnIndex': 9, 'endColumnIndex': 10}, 'cell': {'userEnteredFormat': {'numberFormat': {'type': 'CURRENCY', 'pattern': '\"₹\"#,##0.00'}}}, 'fields': 'userEnteredFormat.numberFormat'}},
+        # Formats the Discount Column (H) safely as a Percentage
+        {'repeatCell': {'range': {'sheetId': quotation_gid, 'startRowIndex': 11, 'endRowIndex': last_row, 'startColumnIndex': 7, 'endColumnIndex': 8}, 'cell': {'userEnteredFormat': {'numberFormat': {'type': 'PERCENT', 'pattern': '0%'}}}, 'fields': 'userEnteredFormat.numberFormat'}}
+    ]
+    sheets_service.spreadsheets().batchUpdate(spreadsheetId=new_sheet_id, body={'requests': post_reqs}).execute()
+
+    pdf_filename = f"{sheet_title}.pdf"
+    pdf_bytes = export_sheet_to_pdf_InDrive(sheets_service, drive_service, authed_session, new_sheet_id, quotation_gid, pdf_filename, folder_id)
+    send_quote_email(gmail_service, data['email'], quote_no, company, pdf_bytes, pdf_filename, po_ref)
 
 def process_revisions(sheets_service, drive_service, authed_session):
-    """Scans saved QTN spreadsheets; if staff typed REVISE in M4, syncs new items & generates Revised PDF."""
     stock_map, _ = load_master_stock_map(sheets_service)
-
-    query = (
-        "name contains 'QTN-' and "
-        "mimeType = 'application/vnd.google-apps.spreadsheet' and "
-        "trashed = false"
-    )
-    files = drive_service.files().list(q=query, fields="files(id, name, parents)").execute().get('files', [])
+    files = drive_service.files().list(q="name contains 'QTN-' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false", fields="files(id, name, parents)").execute().get('files', [])
 
     for f in files:
-        sheet_id = f['id']
-        sheet_name = f['name']
-        parents = f.get('parents', [ARCHIVE_FOLDER_ID])
-        folder_id = parents[0] if parents else ARCHIVE_FOLDER_ID
-
+        sheet_id, sheet_name, folder_id = f['id'], f['name'], f.get('parents', [ARCHIVE_FOLDER_ID])[0]
         try:
-            trigger_res = sheets_service.spreadsheets().values().get(
-                spreadsheetId=sheet_id, range='Quotation!M4'
-            ).execute()
-            trigger_val = trigger_res.get('values', [['']])[0][0].strip().upper()
-        except Exception:
-            continue
+            if sheets_service.spreadsheets().values().get(spreadsheetId=sheet_id, range='Quotation!M4').execute().get('values', [['']])[0][0].strip().upper() not in ('REVISE', 'TRUE', 'YES', '1'): continue
+        except: continue
+        print(f"\n[Revision] Processing '{sheet_name}'...")
+        
+        sheet_data = sheets_service.spreadsheets().values().get(spreadsheetId=sheet_id, range='Quotation!A12:J120').execute().get('values', [])
+        gt_val, words_row = 0, -1
+        
+        for idx, r in enumerate(sheet_data):
+            r += [''] * (10 - len(r))
+            if r[1].strip(): sync_item_to_master_stock(sheets_service, stock_map, r[1], r[2], r[4], r[5], r[6])
+            if "GRAND TOTAL" in str(r[8]).upper():
+                try: gt_val = round(float(str(r[9]).replace('₹', '').replace(',', '').strip()))
+                except: pass
+            if "AMOUNT IN WORDS:" in str(r[0]).upper(): words_row = 12 + idx
+        
+        if gt_val > 0 and words_row > 0:
+            sheets_service.spreadsheets().values().batchUpdate(spreadsheetId=sheet_id, body={'valueInputOption': 'USER_ENTERED', 'data': [{'range': f'Quotation!A{words_row}', 'values': [[f"Amount in Words: {get_amount_in_words(gt_val)}"]]}]}).execute()
 
-        if trigger_val not in ('REVISE', 'TRUE', 'YES', '1'):
-            continue
-
-        print(f"\n[Revision Detected] Processing '{sheet_name}'...")
-
-        rows_res = sheets_service.spreadsheets().values().get(
-            spreadsheetId=sheet_id, range='Quotation!A12:G100'
-        ).execute()
-        for r in rows_res.get('values', []):
-            r += [''] * (7 - len(r))
-            _, desc, hsn, qty, uom, brand, base_price = r[:7]
-            if desc.strip():
-                sync_item_to_master_stock(
-                    sheets_service, stock_map, desc, hsn, uom, brand, base_price
-                )
-
-        parts = sheet_name.split()
-        quote_no = parts[0] if parts else "QTN-01"
-        first_word = parts[1] if len(parts) > 1 else "Client"
-        revised_pdf_name = f"{quote_no} {first_word} Revised.pdf"
-
+        revised_pdf_name = f"{sheet_name.split()[0]} {sheet_name.split()[1] if len(sheet_name.split()) > 1 else 'Client'} Revised.pdf"
         meta = sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
-        quotation_gid = meta['sheets'][0]['properties']['sheetId']
-
-        export_sheet_to_pdf_InDrive(
-            drive_service, authed_session, sheet_id, quotation_gid, revised_pdf_name, folder_id
-        )
+        export_sheet_to_pdf_InDrive(sheets_service, drive_service, authed_session, sheet_id, meta['sheets'][0]['properties']['sheetId'], revised_pdf_name, folder_id)
 
         now_str = datetime.now().strftime('%d/%m %H:%M')
-        sheets_service.spreadsheets().values().batchUpdate(
-            spreadsheetId=sheet_id,
-            body={
-                'valueInputOption': 'USER_ENTERED',
-                'data': [
-                    {'range': 'Quotation!M4', 'values': [['']]},
-                    {'range': 'Quotation!L5', 'values': [[f'✅ {revised_pdf_name} ready ({now_str})']]}
-                ]
-            }
-        ).execute()
-
+        sheets_service.spreadsheets().values().batchUpdate(spreadsheetId=sheet_id, body={'valueInputOption': 'USER_ENTERED', 'data': [{'range': 'Quotation!M4', 'values': [['']]}, {'range': 'Quotation!L5', 'values': [[f'✅ {revised_pdf_name} ready ({now_str})']]}]}).execute()
 
 if __name__ == '__main__':
     print("=== Jai Electricals Quote Manager & Auto-Learner ===")
     sheets_svc, drive_svc, gmail_svc, session = get_services()
+    try: drive_svc.files().list(pageSize=1).execute()
+    except Exception as e:
+        if "403" in str(e) or "401" in str(e) or "insufficientPermissions" in str(e):
+            print("\n[Auto-Heal] Detected insufficient permissions! Resetting auth...")
+            sheets_svc, drive_svc, gmail_svc, session = get_services(force_refresh=True)
+        else: raise e
     process_approved_quotes(sheets_svc, drive_svc, gmail_svc, session)
     process_revisions(sheets_svc, drive_svc, session)
     print("\n=== Quote Manager Complete ===")
