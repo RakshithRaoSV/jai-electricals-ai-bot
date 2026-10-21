@@ -22,7 +22,6 @@ except ImportError:
 
 load_dotenv()
 
-# --- CONFIGURATION ---
 socket.setdefaulttimeout(300)
 SCOPES = [
     'https://mail.google.com/',
@@ -31,6 +30,7 @@ SCOPES = [
 ]
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 ARCHIVE_FOLDER_ID = os.getenv('ARCHIVE_FOLDER_ID')
+STAFF_EMAIL_ADDRESS = "jaielectri@gmail.com" # Core staff email to always CC
 
 def get_oauth_credentials(force_refresh=False):
     if force_refresh and os.path.exists('token.json'): os.remove('token.json')
@@ -93,20 +93,27 @@ def export_sheet_to_pdf_InDrive(sheets_service, drive_service, authed_session, s
         q = f"'{folder_id}' in parents and name = '{safe_pdf_name}' and trashed = false"
         existing = drive_service.files().list(q=q, fields="files(id)").execute(num_retries=3).get('files', [])
         media = MediaIoBaseUpload(io.BytesIO(pdf_bytes), mimetype='application/pdf', resumable=True)
-        
         if existing: drive_service.files().update(fileId=existing[0]['id'], media_body=media).execute(num_retries=5)
         else: drive_service.files().create(body={'name': pdf_filename, 'parents': [folder_id]}, media_body=media, fields='id').execute(num_retries=5)
         return pdf_bytes
     finally:
         sheets_service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={'requests': [{'updateDimensionProperties': {'range': {'sheetId': gid, 'dimension': 'COLUMNS', 'startIndex': 10, 'endIndex': 26}, 'properties': {'hiddenByUser': False}, 'fields': 'hiddenByUser'}}]}).execute(num_retries=3)
 
-def send_quote_email(gmail_service, recipient_email, quote_no, company_name, pdf_bytes, pdf_filename, po_ref):
+# --- UPDATED: Dynamic CC Dispatcher ---
+def send_quote_email(gmail_service, recipient_email, cc_emails, quote_no, company_name, pdf_bytes, pdf_filename, po_ref):
     if not recipient_email or '@' not in recipient_email: return
+    
     msg = EmailMessage()
     subject_tail = f"({company_name})" if po_ref.upper() == 'GENERAL' else f"({company_name} - {po_ref})"
     msg['Subject'] = f"Quotation {quote_no} - Jai Electricals {subject_tail}"
     msg['From'] = "Jai Electricals <jaielectri.quotes@gmail.com>"
     msg['To'] = recipient_email
+    
+    # Bundle the client's CCs with the mandatory Staff CC
+    all_ccs = [STAFF_EMAIL_ADDRESS]
+    if cc_emails: all_ccs.append(cc_emails)
+    msg['Cc'] = ", ".join(all_ccs)
+    
     msg.set_content(f"Dear {company_name},\n\nThank you for your inquiry. Please find attached our quotation ({quote_no}) for your requested materials.\n\nBest Regards,\nJAI ELECTRICALS")
     msg.add_attachment(pdf_bytes, maintype='application', subtype='pdf', filename=pdf_filename)
     gmail_service.users().messages().send(userId='me', body={'raw': base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')}).execute(num_retries=3)
@@ -122,14 +129,12 @@ def clean_num(v):
     return float(m.group()) if m else 0.0
 
 def _process_single_quote(sheets_service, drive_service, gmail_service, authed_session, quote_no, data):
-    """Worker function to process a single quote block end-to-end."""
     print(f" -> [Worker] Generating PDF for '{data['company']}' (PO: {data['po_ref']})...")
     company, address, items, po_ref = data['company'], data['address'], data['items'], data['po_ref']
     folder_id = get_or_create_company_folder(drive_service, company)
     file_tail = "" if po_ref.upper() == 'GENERAL' else f" - {re.sub(r'[\\/*?:\"<>|]', '', po_ref)}"
     sheet_title = f"{quote_no} {company}{file_tail}"
 
-    # Delete existing template copy if it exists to avoid clutter
     for old_f in drive_service.files().list(q=f"'{folder_id}' in parents and name = '{sheet_title.replace('''\'''', '''\\\'''')}' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false", fields="files(id)").execute(num_retries=3).get('files', []):
         drive_service.files().delete(fileId=old_f['id']).execute(num_retries=3)
 
@@ -155,31 +160,22 @@ def _process_single_quote(sheets_service, drive_service, gmail_service, authed_s
 
     sheets_service.spreadsheets().values().clear(spreadsheetId=new_sheet_id, range=f'Quotation!A12:J{subtotal_idx}').execute(num_retries=3)
 
-    item_rows = []
-    python_subtotal = 0.0
+    item_rows, python_subtotal = [], 0.0
     for idx, item in enumerate(items, start=1):
         row_num = 11 + idx  
-        bp_val = clean_num(item.get('base_price'))
-        qty_val = clean_num(item.get('qty'))
+        bp_val, qty_val = clean_num(item.get('base_price')), clean_num(item.get('qty'))
         d_raw = clean_num(item.get('discount'))
         d_val = (d_raw / 100.0) if d_raw > 1.0 else d_raw
         sheet_disc = d_val if d_val > 0 else ""
-
         net_rate_fmla = f'=IF(B{row_num}="", "", G{row_num}*(1-IF(ISNUMBER(H{row_num}), H{row_num}, 0)))'
         amt_fmla = f'=IF(B{row_num}="", "", D{row_num}*I{row_num})'
-
-        item_rows.append([
-            idx, str(item.get('official_name', '')).upper(), str(item.get('hsn', '')).upper(), 
-            qty_val, str(item.get('uom', '')).upper(), str(item.get('brand', '')).upper(), 
-            bp_val, sheet_disc, net_rate_fmla, amt_fmla
-        ])
+        item_rows.append([idx, str(item.get('official_name', '')).upper(), str(item.get('hsn', '')).upper(), qty_val, str(item.get('uom', '')).upper(), str(item.get('brand', '')).upper(), bp_val, sheet_disc, net_rate_fmla, amt_fmla])
         python_subtotal += (qty_val * bp_val) * (1.0 - d_val)
 
     last_row = 11 + len(items)
     frt_val = clean_num(data.get('freight'))
     taxable = python_subtotal + frt_val
-    gst_mode = str(data.get('gst', '')).upper()
-    tax_reg = str(data.get('tax_reg', '')).upper()
+    gst_mode, tax_reg = str(data.get('gst', '')).upper(), str(data.get('tax_reg', '')).upper()
 
     structural_reqs = []
     gt_idx = subtotal_idx + 3 
@@ -200,20 +196,19 @@ def _process_single_quote(sheets_service, drive_service, gmail_service, authed_s
     new_subtotal_row = subtotal_idx + 1
     current_row = new_subtotal_row
     
+    freight_row = None
     if frt_val > 0:
         current_row += 1
         freight_row = current_row
-    else: freight_row = None
         
+    tax1_row, tax2_row = None, None
     if 'WITHOUT' in gst_mode:
-        tax1_row, tax2_row = None, None
         current_row += 1
         gt_row = current_row
         est_gt = taxable
     elif 'IGST' in tax_reg:
         current_row += 1
         tax1_row = current_row
-        tax2_row = None
         current_row += 1
         gt_row = current_row
         est_gt = taxable * 1.18
@@ -227,10 +222,8 @@ def _process_single_quote(sheets_service, drive_service, gmail_service, authed_s
         est_gt = taxable * 1.18
         
     words_row = gt_row + 1
-
     to_text = f"To:\n{str(company).upper()}\n{address}"
-    if po_ref.upper() != 'GENERAL':
-        to_text += f"\nPO Ref: {po_ref}"
+    if po_ref.upper() != 'GENERAL': to_text += f"\nPO Ref: {po_ref}"
 
     update_data = [
         {'range': 'Quotation!B4', 'values': [[quote_no]]},
@@ -268,7 +261,9 @@ def _process_single_quote(sheets_service, drive_service, gmail_service, authed_s
 
     pdf_filename = f"{sheet_title}.pdf"
     pdf_bytes = export_sheet_to_pdf_InDrive(sheets_service, drive_service, authed_session, new_sheet_id, quotation_gid, pdf_filename, folder_id)
-    send_quote_email(gmail_service, data['email'], quote_no, company, pdf_bytes, pdf_filename, po_ref)
+    
+    # Pass CC emails to dispatcher
+    send_quote_email(gmail_service, data['email'], data.get('cc_emails', ''), quote_no, company, pdf_bytes, pdf_filename, po_ref)
     
     print(f" -> [Worker] Successfully finalized {quote_no} for {company}.")
     return quote_no, data
@@ -287,18 +282,25 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
         row += [''] * (18 - len(row))
         col_a, address, po_ref, source_link, status, client_req, official_name, brand, hsn, qty, uom, unit_price, discount, total, freight, gst_mode, tax_region, action = row[:18]
         
+        # Parse multi-line Column A (Company \n TrueEmail \n CC: TrueCC)
         if col_a.strip():
             parts = col_a.split('\n')
             company = parts[0].strip()
             email = parts[1].strip() if len(parts) > 1 else ""
+            
+            client_cc_str = ""
+            if len(parts) > 2:
+                cc_parts = [p.replace("CC:", "").strip() for p in parts[2:] if p.upper().startswith("CC:")]
+                if cc_parts: client_cc_str = ", ".join(cc_parts)
+            
             clean_po = po_ref.strip() if po_ref.strip() else 'General'
             
             if action.strip().upper() == 'APPROVE' and company:
                 current_block_key = f"{company}_{clean_po}_{i}"
                 approved_batches[current_block_key] = {
-                    'company': company, 'email': email, 'address': address, 'po_ref': clean_po, 
-                    'freight': freight, 'gst': gst_mode, 'tax_reg': tax_region, 'action_row': i,
-                    'items': [], 'row_indices': []
+                    'company': company, 'email': email, 'cc_emails': client_cc_str, 'address': address, 
+                    'po_ref': clean_po, 'freight': freight, 'gst': gst_mode, 'tax_reg': tax_region, 
+                    'action_row': i, 'items': [], 'row_indices': []
                 }
             else:
                 current_block_key = None 
@@ -315,12 +317,9 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
             })
             approved_batches[current_block_key]['row_indices'].append(i)
 
-    if not approved_batches:
-        return
+    if not approved_batches: return
 
     print(f"\n[Module] Found {len(approved_batches)} approved quotes. Processing concurrently...")
-    
-    # Process all approvals simultaneously
     status_updates = []
     base_quote_num = int(datetime.now().timestamp()) % 10000
     
@@ -333,19 +332,14 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
         for future in as_completed(futures):
             try:
                 completed_quote_no, completed_data = future.result()
-                # Queue up the success statuses
                 for row_idx in completed_data['row_indices']:
                     status_updates.append({'range': f'Bulk Import!E{row_idx}', 'values': [[f'✅ SENT ({completed_quote_no})']]})
                 status_updates.append({'range': f'Bulk Import!R{completed_data["action_row"]}', 'values': [[f'✅ SENT ({completed_quote_no})']]})
             except Exception as e:
                 print(f" -> [Error] A worker thread failed: {e}")
 
-    # Fire ONE massive batched update to mark everything SENT in the Bulk Import sheet instantly
     if status_updates:
-        sheets_service.spreadsheets().values().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID, 
-            body={'valueInputOption': 'USER_ENTERED', 'data': status_updates}
-        ).execute(num_retries=3)
+        sheets_service.spreadsheets().values().batchUpdate(spreadsheetId=SPREADSHEET_ID, body={'valueInputOption': 'USER_ENTERED', 'data': status_updates}).execute(num_retries=3)
         print(f"[Module] Synced '✅ SENT' statuses to the master tracker.")
 
 def process_revisions(sheets_service, drive_service, authed_session):
