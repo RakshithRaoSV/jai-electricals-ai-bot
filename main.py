@@ -26,9 +26,6 @@ SCOPES = [
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
-_STOCK_CACHE = {'timestamp': 0.0, 'data': []}
-STOCK_CACHE_TTL_SECONDS = 1800
-
 def get_oauth_credentials():
     creds = None
     if os.path.exists('token.json'):
@@ -113,21 +110,6 @@ def get_unread_rfqs(gmail_service):
         
     return extracted_emails
 
-def get_master_stock(sheets_service):
-    global _STOCK_CACHE
-    now = time.time()
-    if _STOCK_CACHE['data'] and (now - _STOCK_CACHE['timestamp'] < STOCK_CACHE_TTL_SECONDS):
-        return _STOCK_CACHE['data']
-    print("[Module B1] Fetching fresh Master Stock from Google Sheets...")
-    result = sheets_service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range='Master_Stock!A:G').execute()
-    rows = result.get('values', [])
-    if not rows: return []
-    headers = [h.strip().upper() for h in rows[0]]
-    catalog = [dict(zip(headers, row + [''] * (len(headers) - len(row)))) for row in rows[1:]]
-    _STOCK_CACHE['data'] = catalog
-    _STOCK_CACHE['timestamp'] = now
-    return catalog
-
 def _upload_single_media(client, media):
     ext = ".pdf" if "pdf" in media['mime_type'].lower() else ".jpg"
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as temp_file:
@@ -141,16 +123,12 @@ def _upload_single_media(client, media):
     finally:
         if os.path.exists(temp_path): os.remove(temp_path)
 
-def match_rfq_with_gemini(client, raw_rfq_text, media_attachments, stock_list, sender, cc_header):
+def match_rfq_with_gemini(client, raw_rfq_text, media_attachments, sender, cc_header):
     if not raw_rfq_text.strip() and not media_attachments: return {}
-    compact_catalog = [{"official_name": item.get("ITEM_NAME", "").strip(), "brand": item.get("BRAND", "").strip()} for item in stock_list if item.get("ITEM_NAME", "").strip()]
 
     prompt_text = f"""
-You are an expert procurement assistant for Jai Electricals. 
-Analyze the client's email, spreadsheets, and attached files.
-
-Official Catalog:
-{json.dumps(compact_catalog, indent=2)}
+You are an expert procurement assistant for Jai Electricals based in India.
+Analyze the client's email, spreadsheets, and attached files to extract the request.
 
 Raw Email Data:
 \"\"\"Sender: {sender}
@@ -159,8 +137,11 @@ CC: {cc_header}
 
 Instructions:
 1. Extract "company_name" and "address".
-2. Match requested items to exact 'official_name' from Catalog. If unknown, set official_name to null.
-3. CRITICAL - TRUE CLIENT IDENTIFICATION: If this is a FORWARDED message (e.g., forwarded by staff), extract the original client's email address from the forwarded body text as 'client_email', and any original client CCs as 'client_cc'. If it is NOT forwarded, extract the email from the 'Sender' header and use the 'CC' header.
+2. TRUE CLIENT IDENTIFICATION: If this is a FORWARDED message, extract the original client's email address from the forwarded body text as 'client_email', and any original client CCs as 'client_cc'. If it is NOT forwarded, extract the email from the 'Sender' header and use the 'CC' header.
+3. DOMAIN EXPERTISE: For each requested item, intelligently auto-correct the raw input into a clean, professional electrical 'official_name'.
+4. Identify the standard electrical 'brand' (e.g., Dowells, Polycab, Legrand) if implied, otherwise output "General".
+5. Infer the correct Indian GST 'hsn_code' for the electrical item (e.g., 8536, 8544, etc.).
+6. Map every single item to its exact 'po_reference' from the specific document it belongs to.
 
 Return ONLY a valid JSON object matching this structure:
 {{
@@ -172,11 +153,12 @@ Return ONLY a valid JSON object matching this structure:
   "freight": 0,
   "items": [
     {{
-      "raw_input": "original item text",
-      "official_name": "exact name or null",
+      "raw_input": "original sloppy item text",
+      "official_name": "Corrected Professional Name",
+      "brand": "Brand Name or General",
+      "hsn_code": "8536 or relevant code",
       "quantity": 10,
-      "unit": "NOS or null",
-      "matched": true,
+      "unit": "NOS/coils/mtrs",
       "po_reference": "PO-101 or General"
     }}
   ]
@@ -196,7 +178,7 @@ Return ONLY a valid JSON object matching this structure:
     parsed_data = {}
     for attempt in range(3):
         try:
-            print(" -> Processing payload with Gemini 3.8 Vision...")
+            print(" -> Processing payload with Gemini 3.8 Vision (Catalog-Free Mode)...")
             response = client.models.generate_content(model='gemini-3.8-flash', contents=contents, config=types.GenerateContentConfig(response_mime_type="application/json"))
             raw_text = response.text.strip()
             if raw_text.startswith("```json"): raw_text = raw_text[7:-3].strip()
@@ -214,13 +196,11 @@ Return ONLY a valid JSON object matching this structure:
     return parsed_data
 
 def append_to_bulk_import(sheets_service, parsed_data, sender, cc_header, email_id):
-    # 1. Resolve True Client Email
     client_email = parsed_data.get('client_email', '').strip()
     if not client_email or client_email.lower() == 'empty':
         email_match = re.search(r'<(.+?)>', sender)
         client_email = email_match.group(1) if email_match else sender
         
-    # 2. Resolve True Client CCs
     client_cc = parsed_data.get('client_cc', '').strip()
     if not client_cc or client_cc.lower() == 'empty':
         client_cc = cc_header
@@ -231,7 +211,6 @@ def append_to_bulk_import(sheets_service, parsed_data, sender, cc_header, email_
     tax_region = parsed_data.get('tax_region', 'CGST/SGST')
     freight = parsed_data.get('freight', 0)
     
-    # Store Email and CCs in Column A for Quote Manager to read later
     col_a_header = f"{company}\n{client_email}"
     if client_cc: col_a_header += f"\nCC: {client_cc}"
 
@@ -248,14 +227,22 @@ def append_to_bulk_import(sheets_service, parsed_data, sender, cc_header, email_
 
     for po_ref, group_items in po_groups.items():
         for idx, item in enumerate(group_items):
+            # Fetch the AI-generated Brand and HSN Code
+            gen_brand = item.get('brand', '')
+            gen_hsn = item.get('hsn_code', '')
+            
             if idx == 0:
                 rows_to_insert.append([
                     col_a_header, address, po_ref, source_link, status_formula, item.get('raw_input', ''), 
-                    item.get('official_name') or "", "", "", item.get('quantity', ''), item.get('unit', ''),
+                    item.get('official_name', ''), gen_brand, gen_hsn, item.get('quantity', ''), item.get('unit', ''),
                     "", "", total_formula, freight, gst_mode, tax_region, ""
                 ])
             else:
-                rows_to_insert.append([" ", "", "", "", status_formula, item.get('raw_input', ''), item.get('official_name') or "", "", "", item.get('quantity', ''), item.get('unit', ''), "", "", total_formula, "", "", "", ""])
+                rows_to_insert.append([
+                    " ", "", "", "", status_formula, item.get('raw_input', ''), 
+                    item.get('official_name', ''), gen_brand, gen_hsn, item.get('quantity', ''), item.get('unit', ''), 
+                    "", "", total_formula, "", "", "", ""
+                ])
         rows_to_insert.append([" "] + [""] * 17)
         rows_to_insert.append([" "] + [""] * 17)
         
@@ -263,7 +250,7 @@ def append_to_bulk_import(sheets_service, parsed_data, sender, cc_header, email_
         sheets_service.spreadsheets().values().append(spreadsheetId=SPREADSHEET_ID, range='Bulk Import!A:A', valueInputOption='USER_ENTERED', insertDataOption='INSERT_ROWS', body={'values': rows_to_insert}).execute()
 
 def run_ingestion_pipeline():
-    print("=== Jai Electricals AI Quoting Engine (Optimized) ===")
+    print("=== Jai Electricals AI Quoting Engine (High-Speed Mode) ===")
     creds = get_oauth_credentials()
     gmail_service = build('gmail', 'v1', credentials=creds)
     sheets_service = build('sheets', 'v4', credentials=creds)
@@ -271,10 +258,10 @@ def run_ingestion_pipeline():
 
     emails = get_unread_rfqs(gmail_service)
     if emails:
-        stock = get_master_stock(sheets_service)
         for email in emails:
             print(f"\nProcessing RFQ from {email['sender']}...")
-            parsed_payload = match_rfq_with_gemini(genai_client, email['body'], email['media'], stock, email['sender'], email['cc'])
+            # Bypassed Master Stock entirely!
+            parsed_payload = match_rfq_with_gemini(genai_client, email['body'], email['media'], email['sender'], email['cc'])
             if parsed_payload and parsed_payload.get('items'):
                 append_to_bulk_import(sheets_service, parsed_payload, email['sender'], email['cc'], email['id'])
                 gmail_service.users().messages().modify(userId='me', id=email['id'], body={'removeLabelIds': ['UNREAD']}).execute()
@@ -283,4 +270,4 @@ def run_ingestion_pipeline():
     print("\n=== Pipeline Execution Complete ===")
 
 if __name__ == '__main__':
-    run_ingestion_pipeline() 
+    run_ingestion_pipeline()
