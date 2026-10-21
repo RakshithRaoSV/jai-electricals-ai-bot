@@ -20,8 +20,9 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 SCOPES = [
+    'https://mail.google.com/',
     'https://www.googleapis.com/auth/spreadsheets',
-    'https://mail.google.com/'
+    'https://www.googleapis.com/auth/drive'
 ]
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
@@ -178,17 +179,22 @@ Return ONLY a valid JSON object matching this structure:
     parsed_data = {}
     for attempt in range(3):
         try:
-            print(" -> Processing payload with Gemini 3.8 Vision (Catalog-Free Mode)...")
+            print(f" -> [Attempt {attempt+1}/3] Processing payload with Gemini 3.8 Vision...")
             response = client.models.generate_content(model='gemini-3.8-flash', contents=contents, config=types.GenerateContentConfig(response_mime_type="application/json"))
             raw_text = response.text.strip()
             if raw_text.startswith("```json"): raw_text = raw_text[7:-3].strip()
             elif raw_text.startswith("```"): raw_text = raw_text[3:-3].strip()
+            
             parsed_data = json.loads(raw_text)
             break
         except Exception as e:
-            if "503" in str(e) or "429" in str(e):
-                time.sleep(10 * (attempt + 1))
-            else: break
+            print(f"    [!] AI Error Details: {e}") # This will expose the hidden error!
+            if "503" in str(e) or "429" in str(e) or "quota" in str(e).lower():
+                wait_time = 10 * (attempt + 1)
+                print(f"    [!] AI Server busy or Rate Limited. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else: 
+                break
 
     for f in uploaded_files:
         try: client.files.delete(name=f.name)

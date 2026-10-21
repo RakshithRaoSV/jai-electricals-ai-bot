@@ -30,7 +30,7 @@ SCOPES = [
 ]
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 ARCHIVE_FOLDER_ID = os.getenv('ARCHIVE_FOLDER_ID')
-STAFF_EMAIL_ADDRESS = "jaielectri@gmail.com" # Core staff email to always CC
+STAFF_EMAIL_ADDRESS = "jaielectri@gmail.com" 
 
 def get_oauth_credentials(force_refresh=False):
     if force_refresh and os.path.exists('token.json'): os.remove('token.json')
@@ -99,17 +99,14 @@ def export_sheet_to_pdf_InDrive(sheets_service, drive_service, authed_session, s
     finally:
         sheets_service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={'requests': [{'updateDimensionProperties': {'range': {'sheetId': gid, 'dimension': 'COLUMNS', 'startIndex': 10, 'endIndex': 26}, 'properties': {'hiddenByUser': False}, 'fields': 'hiddenByUser'}}]}).execute(num_retries=3)
 
-# --- UPDATED: Dynamic CC Dispatcher ---
 def send_quote_email(gmail_service, recipient_email, cc_emails, quote_no, company_name, pdf_bytes, pdf_filename, po_ref):
     if not recipient_email or '@' not in recipient_email: return
-    
     msg = EmailMessage()
     subject_tail = f"({company_name})" if po_ref.upper() == 'GENERAL' else f"({company_name} - {po_ref})"
     msg['Subject'] = f"Quotation {quote_no} - Jai Electricals {subject_tail}"
     msg['From'] = "Jai Electricals <jaielectri.quotes@gmail.com>"
     msg['To'] = recipient_email
     
-    # Bundle the client's CCs with the mandatory Staff CC
     all_ccs = [STAFF_EMAIL_ADDRESS]
     if cc_emails: all_ccs.append(cc_emails)
     msg['Cc'] = ", ".join(all_ccs)
@@ -248,7 +245,6 @@ def _process_single_quote(sheets_service, drive_service, gmail_service, authed_s
         update_data.append({'range': f'Quotation!I{tax2_row}:J{tax2_row}', 'values': [["SGST (9%)", f"=IFERROR({tax_base}*0.09, 0)"]]})
         
     update_data.append({'range': f'Quotation!J{gt_row}', 'values': [[f"=SUM(J{new_subtotal_row}:J{gt_row-1})"]]})
-
     sheets_service.spreadsheets().values().batchUpdate(spreadsheetId=new_sheet_id, body={'valueInputOption': 'USER_ENTERED', 'data': update_data}).execute(num_retries=3)
 
     post_reqs = [
@@ -261,15 +257,17 @@ def _process_single_quote(sheets_service, drive_service, gmail_service, authed_s
 
     pdf_filename = f"{sheet_title}.pdf"
     pdf_bytes = export_sheet_to_pdf_InDrive(sheets_service, drive_service, authed_session, new_sheet_id, quotation_gid, pdf_filename, folder_id)
-    
-    # Pass CC emails to dispatcher
     send_quote_email(gmail_service, data['email'], data.get('cc_emails', ''), quote_no, company, pdf_bytes, pdf_filename, po_ref)
     
     print(f" -> [Worker] Successfully finalized {quote_no} for {company}.")
     return quote_no, data
 
+
 def process_approved_quotes(sheets_service, drive_service, gmail_service, authed_session):
     stock_map, _ = load_master_stock_map(sheets_service)
+    
+    meta = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute(num_retries=3)
+    bulk_import_gid = next(s['properties']['sheetId'] for s in meta['sheets'] if s['properties']['title'] == 'Bulk Import')
     
     result = sheets_service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range='Bulk Import!A:R').execute(num_retries=3)
     rows = result.get('values', [])
@@ -282,7 +280,6 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
         row += [''] * (18 - len(row))
         col_a, address, po_ref, source_link, status, client_req, official_name, brand, hsn, qty, uom, unit_price, discount, total, freight, gst_mode, tax_region, action = row[:18]
         
-        # Parse multi-line Column A (Company \n TrueEmail \n CC: TrueCC)
         if col_a.strip():
             parts = col_a.split('\n')
             company = parts[0].strip()
@@ -295,6 +292,7 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
             
             clean_po = po_ref.strip() if po_ref.strip() else 'General'
             
+            # THE BOT ONLY ACTIVATES IF YOU TYPE "APPROVE" IN THE ACTION COLUMN
             if action.strip().upper() == 'APPROVE' and company:
                 current_block_key = f"{company}_{clean_po}_{i}"
                 approved_batches[current_block_key] = {
@@ -317,10 +315,23 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
             })
             approved_batches[current_block_key]['row_indices'].append(i)
 
-    if not approved_batches: return
+    if not approved_batches: 
+        return
+
+    # --- NEW SAFETY LOCK: Instantly claim the rows so they can't be double-processed ---
+    lock_requests = []
+    for data in approved_batches.values():
+        lock_requests.append({'range': f"Bulk Import!R{data['action_row']}", 'values': [['⌛ PROCESSING...']]})
+    sheets_service.spreadsheets().values().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID, 
+        body={'valueInputOption': 'USER_ENTERED', 'data': lock_requests}
+    ).execute(num_retries=3)
+    # -----------------------------------------------------------------------------------
 
     print(f"\n[Module] Found {len(approved_batches)} approved quotes. Processing concurrently...")
-    status_updates = []
+    
+    history_records = []
+    blocks_to_delete = []
     base_quote_num = int(datetime.now().timestamp()) % 10000
     
     with ThreadPoolExecutor(max_workers=5) as executor:
@@ -332,15 +343,54 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
         for future in as_completed(futures):
             try:
                 completed_quote_no, completed_data = future.result()
-                for row_idx in completed_data['row_indices']:
-                    status_updates.append({'range': f'Bulk Import!E{row_idx}', 'values': [[f'✅ SENT ({completed_quote_no})']]})
-                status_updates.append({'range': f'Bulk Import!R{completed_data["action_row"]}', 'values': [[f'✅ SENT ({completed_quote_no})']]})
+                
+                history_records.append([
+                    datetime.now().strftime('%d/%m/%Y %H:%M'),
+                    completed_quote_no,
+                    completed_data['company'],
+                    completed_data['email'],
+                    completed_data['po_ref']
+                ])
+                
+                start_row = completed_data['action_row']
+                end_row = completed_data['row_indices'][-1] + 2
+                blocks_to_delete.append((start_row, end_row))
+                
             except Exception as e:
                 print(f" -> [Error] A worker thread failed: {e}")
 
-    if status_updates:
-        sheets_service.spreadsheets().values().batchUpdate(spreadsheetId=SPREADSHEET_ID, body={'valueInputOption': 'USER_ENTERED', 'data': status_updates}).execute(num_retries=3)
-        print(f"[Module] Synced '✅ SENT' statuses to the master tracker.")
+    if history_records:
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID, 
+            range='History!A:E', 
+            valueInputOption='USER_ENTERED', 
+            insertDataOption='INSERT_ROWS', 
+            body={'values': history_records}
+        ).execute(num_retries=3)
+        print(f"[Module] Archived {len(history_records)} quotes to the History tab.")
+
+    if blocks_to_delete:
+        # Crucial: Delete from the bottom of the sheet upwards so row IDs don't shift during deletion
+        blocks_to_delete.sort(key=lambda x: x[0], reverse=True)
+        
+        delete_requests = []
+        for start_r, end_r in blocks_to_delete:
+            delete_requests.append({
+                'deleteDimension': {
+                    'range': {
+                        'sheetId': bulk_import_gid,
+                        'dimension': 'ROWS',
+                        'startIndex': start_r - 1, 
+                        'endIndex': end_r
+                    }
+                }
+            })
+        
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID, 
+            body={'requests': delete_requests}
+        ).execute(num_retries=3)
+        print(f"[Module] Cleaned up 'Bulk Import' tab by removing {len(blocks_to_delete)} completed blocks.")
 
 def process_revisions(sheets_service, drive_service, authed_session):
     stock_map, _ = load_master_stock_map(sheets_service)
