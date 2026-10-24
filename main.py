@@ -59,7 +59,6 @@ def extract_email_content(gmail_service, msg_id, payload):
             elif 'attachmentId' in part['body']:
                 att_id = part['body']['attachmentId']
                 if filename.endswith('.csv') or filename.endswith('.xlsx'):
-                    print(f" -> Found spreadsheet: {filename}. Lazy-loading pandas...")
                     import pandas as pd
                     att = gmail_service.users().messages().attachments().get(userId='me', messageId=msg_id, id=att_id).execute()
                     file_data = base64.urlsafe_b64decode(att['data'])
@@ -68,7 +67,7 @@ def extract_email_content(gmail_service, msg_id, payload):
                         else: df = pd.read_excel(io.BytesIO(file_data))
                         attachments_text += f"\n--- ATTACHMENT: {filename} ---\n{df.to_string()}\n"
                     except Exception as e:
-                        print(f" -> Could not read spreadsheet {filename}: {e}")
+                        pass
                         
                 elif mime_type.startswith('image/') or mime_type == 'application/pdf':
                     att = gmail_service.users().messages().attachments().get(userId='me', messageId=msg_id, id=att_id).execute()
@@ -100,6 +99,7 @@ def get_unread_rfqs(gmail_service):
         
         sender = next((h['value'] for h in headers if h['name'] == 'From'), "")
         cc_header = next((h['value'] for h in headers if h['name'] == 'Cc'), "")
+        message_id = next((h['value'] for h in headers if h['name'].lower() == 'message-id'), "")
         
         if "no-reply@accounts.google.com" in sender or "googleaistudio-noreply" in sender:
             gmail_service.users().messages().modify(userId='me', id=msg['id'], body={'removeLabelIds': ['UNREAD']}).execute()
@@ -107,7 +107,16 @@ def get_unread_rfqs(gmail_service):
             
         print(f"Loaded RFQ from: {sender}")
         body_text, media_attachments = extract_email_content(gmail_service, msg['id'], payload)
-        extracted_emails.append({'id': msg['id'], 'sender': sender, 'cc': cc_header, 'body': body_text, 'media': media_attachments})
+        
+        extracted_emails.append({
+            'id': msg['id'], 
+            'threadId': msg['threadId'],
+            'message_id': message_id,
+            'sender': sender, 
+            'cc': cc_header, 
+            'body': body_text, 
+            'media': media_attachments
+        })
         
     return extracted_emails
 
@@ -118,7 +127,6 @@ def _upload_single_media(client, media):
         temp_path = temp_file.name
     try:
         g_file = client.files.upload(file=temp_path)
-        print(f"    [+] Uploaded {media['filename']}")
         return g_file
     except Exception: return None
     finally:
@@ -169,7 +177,6 @@ Return ONLY a valid JSON object matching this structure:
     uploaded_files = []
 
     if media_attachments:
-        print(f" -> Parallel uploading {len(media_attachments)} attachments to Gemini Storage...")
         with ThreadPoolExecutor(max_workers=min(len(media_attachments), 4)) as executor:
             for result in executor.map(lambda m: _upload_single_media(client, m), media_attachments):
                 if result:
@@ -179,20 +186,17 @@ Return ONLY a valid JSON object matching this structure:
     parsed_data = {}
     for attempt in range(3):
         try:
-            print(f" -> [Attempt {attempt+1}/3] Processing payload with Gemini 3.8 Vision...")
+            print(f" -> [Attempt {attempt+1}/3] Processing payload with Gemini 3.8 Flash...")
             response = client.models.generate_content(model='gemini-3.8-flash', contents=contents, config=types.GenerateContentConfig(response_mime_type="application/json"))
             raw_text = response.text.strip()
             if raw_text.startswith("```json"): raw_text = raw_text[7:-3].strip()
             elif raw_text.startswith("```"): raw_text = raw_text[3:-3].strip()
-            
             parsed_data = json.loads(raw_text)
             break
         except Exception as e:
-            print(f"    [!] AI Error Details: {e}") # This will expose the hidden error!
+            print(f"    [!] AI Error Details: {e}") 
             if "503" in str(e) or "429" in str(e) or "quota" in str(e).lower():
-                wait_time = 10 * (attempt + 1)
-                print(f"    [!] AI Server busy or Rate Limited. Retrying in {wait_time}s...")
-                time.sleep(wait_time)
+                time.sleep(10 * (attempt + 1))
             else: 
                 break
 
@@ -201,7 +205,7 @@ Return ONLY a valid JSON object matching this structure:
         except Exception: pass
     return parsed_data
 
-def append_to_bulk_import(sheets_service, parsed_data, sender, cc_header, email_id):
+def append_to_bulk_import(sheets_service, parsed_data, sender, cc_header, email_id, thread_id, message_id):
     client_email = parsed_data.get('client_email', '').strip()
     if not client_email or client_email.lower() == 'empty':
         email_match = re.search(r'<(.+?)>', sender)
@@ -227,13 +231,15 @@ def append_to_bulk_import(sheets_service, parsed_data, sender, cc_header, email_
         po_groups[po_ref].append(item)
 
     rows_to_insert = []
-    source_link = f"https://mail.google.com/mail/u/0/#inbox/{email_id}"
+    
+    # NEW: Storing Thread ID and Message ID hidden cleanly in the Source Link column
+    source_link = f"https://mail.google.com/mail/u/0/#inbox/{email_id} | TID:{thread_id} | MID:{message_id}"
+    
     status_formula = '=IF(ISBLANK(INDIRECT("F"&ROW())), "", IF(ISBLANK(INDIRECT("G"&ROW())), "❌ NEEDS REVIEW", "✅ Matched"))'
     total_formula = '=IF(OR(ISBLANK(INDIRECT("J"&ROW())), ISBLANK(INDIRECT("L"&ROW()))), "", INDIRECT("J"&ROW())*INDIRECT("L"&ROW())*(1-IF(ISBLANK(INDIRECT("M"&ROW())), 0, INDIRECT("M"&ROW()))))'
 
     for po_ref, group_items in po_groups.items():
         for idx, item in enumerate(group_items):
-            # Fetch the AI-generated Brand and HSN Code
             gen_brand = item.get('brand', '')
             gen_hsn = item.get('hsn_code', '')
             
@@ -266,13 +272,17 @@ def run_ingestion_pipeline():
     if emails:
         for email in emails:
             print(f"\nProcessing RFQ from {email['sender']}...")
-            # Bypassed Master Stock entirely!
             parsed_payload = match_rfq_with_gemini(genai_client, email['body'], email['media'], email['sender'], email['cc'])
+            
             if parsed_payload and parsed_payload.get('items'):
-                append_to_bulk_import(sheets_service, parsed_payload, email['sender'], email['cc'], email['id'])
+                # Pass the new Thread and Message IDs here
+                append_to_bulk_import(sheets_service, parsed_payload, email['sender'], email['cc'], email['id'], email['threadId'], email['message_id'])
                 gmail_service.users().messages().modify(userId='me', id=email['id'], body={'removeLabelIds': ['UNREAD']}).execute()
                 print(" -> Marked email as READ in inbox.")
-            else: print(" -> No parsable items found.")
+            else: 
+                print(" -> [!] No parsable items found or AI Server Failed. Marking as READ to clear the queue.")
+                gmail_service.users().messages().modify(userId='me', id=email['id'], body={'removeLabelIds': ['UNREAD']}).execute()
+                
     print("\n=== Pipeline Execution Complete ===")
 
 if __name__ == '__main__':

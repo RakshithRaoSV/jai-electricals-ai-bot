@@ -3,7 +3,8 @@ import io
 import re
 import base64
 import socket
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
@@ -99,11 +100,35 @@ def export_sheet_to_pdf_InDrive(sheets_service, drive_service, authed_session, s
     finally:
         sheets_service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={'requests': [{'updateDimensionProperties': {'range': {'sheetId': gid, 'dimension': 'COLUMNS', 'startIndex': 10, 'endIndex': 26}, 'properties': {'hiddenByUser': False}, 'fields': 'hiddenByUser'}}]}).execute(num_retries=3)
 
-def send_quote_email(gmail_service, recipient_email, cc_emails, quote_no, company_name, pdf_bytes, pdf_filename, po_ref):
+def send_quote_email(gmail_service, recipient_email, cc_emails, quote_no, company_name, pdf_bytes, pdf_filename, po_ref, thread_id="", message_id=""):
     if not recipient_email or '@' not in recipient_email: return
     msg = EmailMessage()
-    subject_tail = f"({company_name})" if po_ref.upper() == 'GENERAL' else f"({company_name} - {po_ref})"
-    msg['Subject'] = f"Quotation {quote_no} - Jai Electricals {subject_tail}"
+    
+    # --- NEW: GMAIL SUBJECT MATCHING LOGIC ---
+    original_subject = ""
+    if thread_id:
+        try:
+            # Safely fetch the exact subject of the original email thread
+            thread_data = gmail_service.users().threads().get(userId='me', id=thread_id, format='metadata', metadataHeaders=['Subject']).execute(num_retries=3)
+            for t_msg in thread_data.get('messages', []):
+                for header in t_msg.get('payload', {}).get('headers', []):
+                    if header['name'].lower() == 'subject':
+                        original_subject = header['value']
+                        break
+                if original_subject: break
+        except Exception as e:
+            print(f"    [!] Warning: Could not fetch original thread subject: {e}")
+            
+    # If we found the original subject, we MUST use it so Gmail threads it properly.
+    if original_subject:
+        if not original_subject.lower().startswith('re:'):
+            original_subject = f"Re: {original_subject}"
+        msg['Subject'] = original_subject
+    else:
+        # Fallback if no thread is found
+        subject_tail = f"({company_name})" if po_ref.upper() == 'GENERAL' else f"({company_name} - {po_ref})"
+        msg['Subject'] = f"Quotation {quote_no} - Jai Electricals {subject_tail}"
+        
     msg['From'] = "Jai Electricals <jaielectri.quotes@gmail.com>"
     msg['To'] = recipient_email
     
@@ -111,9 +136,19 @@ def send_quote_email(gmail_service, recipient_email, cc_emails, quote_no, compan
     if cc_emails: all_ccs.append(cc_emails)
     msg['Cc'] = ", ".join(all_ccs)
     
+    # Bind the email into the original thread for the client & staff
+    if thread_id and message_id:
+        msg['In-Reply-To'] = message_id
+        msg['References'] = message_id
+    
     msg.set_content(f"Dear {company_name},\n\nThank you for your inquiry. Please find attached our quotation ({quote_no}) for your requested materials.\n\nBest Regards,\nJAI ELECTRICALS")
     msg.add_attachment(pdf_bytes, maintype='application', subtype='pdf', filename=pdf_filename)
-    gmail_service.users().messages().send(userId='me', body={'raw': base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')}).execute(num_retries=3)
+    
+    send_body = {'raw': base64.urlsafe_b64encode(msg.as_bytes()).decode('utf-8')}
+    if thread_id:
+        send_body['threadId'] = thread_id
+        
+    gmail_service.users().messages().send(userId='me', body=send_body).execute(num_retries=3)
 
 def get_amount_in_words(amount):
     if not num2words: return f"Rupees {amount} Only"
@@ -257,11 +292,11 @@ def _process_single_quote(sheets_service, drive_service, gmail_service, authed_s
 
     pdf_filename = f"{sheet_title}.pdf"
     pdf_bytes = export_sheet_to_pdf_InDrive(sheets_service, drive_service, authed_session, new_sheet_id, quotation_gid, pdf_filename, folder_id)
-    send_quote_email(gmail_service, data['email'], data.get('cc_emails', ''), quote_no, company, pdf_bytes, pdf_filename, po_ref)
+    
+    send_quote_email(gmail_service, data['email'], data.get('cc_emails', ''), quote_no, company, pdf_bytes, pdf_filename, po_ref, data.get('thread_id', ''), data.get('message_id', ''))
     
     print(f" -> [Worker] Successfully finalized {quote_no} for {company}.")
     return quote_no, data
-
 
 def process_approved_quotes(sheets_service, drive_service, gmail_service, authed_session):
     stock_map, _ = load_master_stock_map(sheets_service)
@@ -280,6 +315,13 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
         row += [''] * (18 - len(row))
         col_a, address, po_ref, source_link, status, client_req, official_name, brand, hsn, qty, uom, unit_price, discount, total, freight, gst_mode, tax_region, action = row[:18]
         
+        thread_id, message_id = "", ""
+        if " | TID:" in source_link:
+            s_parts = source_link.split(" | ")
+            for p in s_parts:
+                if p.startswith("TID:"): thread_id = p.replace("TID:", "").strip()
+                elif p.startswith("MID:"): message_id = p.replace("MID:", "").strip()
+        
         if col_a.strip():
             parts = col_a.split('\n')
             company = parts[0].strip()
@@ -292,13 +334,13 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
             
             clean_po = po_ref.strip() if po_ref.strip() else 'General'
             
-            # THE BOT ONLY ACTIVATES IF YOU TYPE "APPROVE" IN THE ACTION COLUMN
             if action.strip().upper() == 'APPROVE' and company:
                 current_block_key = f"{company}_{clean_po}_{i}"
                 approved_batches[current_block_key] = {
                     'company': company, 'email': email, 'cc_emails': client_cc_str, 'address': address, 
                     'po_ref': clean_po, 'freight': freight, 'gst': gst_mode, 'tax_reg': tax_region, 
-                    'action_row': i, 'items': [], 'row_indices': []
+                    'action_row': i, 'items': [], 'row_indices': [],
+                    'thread_id': thread_id, 'message_id': message_id
                 }
             else:
                 current_block_key = None 
@@ -318,7 +360,6 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
     if not approved_batches: 
         return
 
-    # --- NEW SAFETY LOCK: Instantly claim the rows so they can't be double-processed ---
     lock_requests = []
     for data in approved_batches.values():
         lock_requests.append({'range': f"Bulk Import!R{data['action_row']}", 'values': [['⌛ PROCESSING...']]})
@@ -326,19 +367,19 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
         spreadsheetId=SPREADSHEET_ID, 
         body={'valueInputOption': 'USER_ENTERED', 'data': lock_requests}
     ).execute(num_retries=3)
-    # -----------------------------------------------------------------------------------
-
-    print(f"\n[Module] Found {len(approved_batches)} approved quotes. Processing concurrently...")
+    
+    print(f"\n[Module] Found {len(approved_batches)} approved quotes. Processing sequentially to protect APIs...")
     
     history_records = []
     blocks_to_delete = []
     base_quote_num = int(datetime.now().timestamp()) % 10000
     
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=1) as executor:
         futures = []
         for index, (key, data) in enumerate(approved_batches.items()):
             quote_no = f"QTN-{base_quote_num + index:04d}"
             futures.append(executor.submit(_process_single_quote, sheets_service, drive_service, gmail_service, authed_session, quote_no, data))
+            time.sleep(1)
             
         for future in as_completed(futures):
             try:
@@ -361,46 +402,42 @@ def process_approved_quotes(sheets_service, drive_service, gmail_service, authed
 
     if history_records:
         sheets_service.spreadsheets().values().append(
-            spreadsheetId=SPREADSHEET_ID, 
-            range='History!A:E', 
-            valueInputOption='USER_ENTERED', 
-            insertDataOption='INSERT_ROWS', 
-            body={'values': history_records}
+            spreadsheetId=SPREADSHEET_ID, range='History!A:E', valueInputOption='USER_ENTERED', 
+            insertDataOption='INSERT_ROWS', body={'values': history_records}
         ).execute(num_retries=3)
         print(f"[Module] Archived {len(history_records)} quotes to the History tab.")
 
     if blocks_to_delete:
-        # Crucial: Delete from the bottom of the sheet upwards so row IDs don't shift during deletion
         blocks_to_delete.sort(key=lambda x: x[0], reverse=True)
-        
         delete_requests = []
         for start_r, end_r in blocks_to_delete:
-            delete_requests.append({
-                'deleteDimension': {
-                    'range': {
-                        'sheetId': bulk_import_gid,
-                        'dimension': 'ROWS',
-                        'startIndex': start_r - 1, 
-                        'endIndex': end_r
-                    }
-                }
-            })
-        
-        sheets_service.spreadsheets().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID, 
-            body={'requests': delete_requests}
-        ).execute(num_retries=3)
+            delete_requests.append({'deleteDimension': {'range': {'sheetId': bulk_import_gid, 'dimension': 'ROWS', 'startIndex': start_r - 1, 'endIndex': end_r}}})
+        sheets_service.spreadsheets().batchUpdate(spreadsheetId=SPREADSHEET_ID, body={'requests': delete_requests}).execute(num_retries=3)
         print(f"[Module] Cleaned up 'Bulk Import' tab by removing {len(blocks_to_delete)} completed blocks.")
 
 def process_revisions(sheets_service, drive_service, authed_session):
     stock_map, _ = load_master_stock_map(sheets_service)
-    files = drive_service.files().list(q="name contains 'QTN-' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false", fields="files(id, name, parents)").execute(num_retries=3).get('files', [])
+    
+    time_limit = (datetime.now(timezone.utc) - timedelta(days=2)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    query = f"name contains 'QTN-' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false and modifiedTime > '{time_limit}'"
+    
+    files = drive_service.files().list(
+        q=query, 
+        pageSize=5, 
+        orderBy="modifiedTime desc", 
+        fields="files(id, name, parents)"
+    ).execute(num_retries=3).get('files', [])
 
     for f in files:
         sheet_id, sheet_name, folder_id = f['id'], f['name'], f.get('parents', [ARCHIVE_FOLDER_ID])[0]
         try:
-            if sheets_service.spreadsheets().values().get(spreadsheetId=sheet_id, range='Quotation!M4').execute(num_retries=3).get('values', [['']])[0][0].strip().upper() not in ('REVISE', 'TRUE', 'YES', '1'): continue
-        except: continue
+            time.sleep(2)
+            val = sheets_service.spreadsheets().values().get(spreadsheetId=sheet_id, range='Quotation!M4').execute(num_retries=3).get('values', [['']])[0][0]
+            if str(val).strip().upper() not in ('REVISE', 'TRUE', 'YES', '1'): 
+                continue
+        except Exception: 
+            continue
+            
         print(f"\n[Revision] Processing '{sheet_name}'...")
         
         sheet_data = sheets_service.spreadsheets().values().get(spreadsheetId=sheet_id, range='Quotation!A12:J120').execute(num_retries=3).get('values', [])
@@ -426,13 +463,21 @@ def process_revisions(sheets_service, drive_service, authed_session):
 
 if __name__ == '__main__':
     print("=== Jai Electricals Quote Manager (Optimized) ===")
-    sheets_svc, drive_svc, gmail_svc, session = get_services()
-    try: drive_svc.files().list(pageSize=1).execute(num_retries=3)
+    try:
+        sheets_svc, drive_svc, gmail_svc, session = get_services()
+        try: drive_svc.files().list(pageSize=1).execute(num_retries=3)
+        except Exception as e:
+            if "403" in str(e) or "401" in str(e) or "insufficientPermissions" in str(e):
+                print("\n[Auto-Heal] Detected insufficient permissions! Resetting auth...")
+                sheets_svc, drive_svc, gmail_svc, session = get_services(force_refresh=True)
+            else: raise e
+        
+        process_approved_quotes(sheets_svc, drive_svc, gmail_svc, session)
+        process_revisions(sheets_svc, drive_svc, session)
+        print("\n=== Quote Manager Complete ===")
+        
     except Exception as e:
-        if "403" in str(e) or "401" in str(e) or "insufficientPermissions" in str(e):
-            print("\n[Auto-Heal] Detected insufficient permissions! Resetting auth...")
-            sheets_svc, drive_svc, gmail_svc, session = get_services(force_refresh=True)
-        else: raise e
-    process_approved_quotes(sheets_svc, drive_svc, gmail_svc, session)
-    process_revisions(sheets_svc, drive_svc, session)
-    print("\n=== Quote Manager Complete ===")
+        if "429" in str(e) or "Quota" in str(e):
+            print("\n[API Limit] Google's 60-requests-per-minute limit was hit. The bot is safely pausing and will resume on the next cycle.")
+        else:
+            raise e

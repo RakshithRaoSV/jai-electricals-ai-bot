@@ -1,14 +1,15 @@
-# Virtual Environment
+# Environments
 venv/
-env/
 __pycache__/
 
-# Security & API Keys
+# Credentials & Secrets (NEVER UPLOAD THESE)
 .env
-credentials.json
 client_secret.json
+credentials.json
 token.json
 
-# OS generated files
-.DS_Store
-Thumbs.db
+# Local artifacts
+*.pdf
+bot_log.txt
+*.log
+run_bot.bat
